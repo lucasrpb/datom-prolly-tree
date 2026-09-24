@@ -267,6 +267,16 @@ class DatomFastCDC(
 
 class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
 
+  private var written = 0L
+
+  /** Total nodes this manager has written; the difference across a call is that call's write cost. */
+  def nodesWritten: Long = written
+
+  private def put(node: ProllyNode): Unit = {
+    store.put(node)
+    written += 1
+  }
+
   def computeLeafHash(datoms: Seq[Datom]): String = {
     val digest = MessageDigest.getInstance("SHA-256")
     datoms.foreach { d =>
@@ -288,7 +298,7 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
   // The empty tree is a single leaf with no datoms.
   def emptyTree(): ProllyNode = {
     val node = LeafNode(computeLeafHash(Nil), Nil)
-    store.put(node)
+    put(node)
     node
   }
 
@@ -298,7 +308,7 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
     val sorted = datoms.distinct.sorted
     val leaves = chunker.chunkDatoms(sorted.iterator).map { chunk =>
       val node = LeafNode(computeLeafHash(chunk), chunk)
-      store.put(node)
+      put(node)
       node
     }.toSeq
 
@@ -314,7 +324,7 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
 
     val parents = boundaries.map { slice =>
       val internal = InternalNode(computeInternalHash(slice), slice, currentLevel)
-      store.put(internal)
+      put(internal)
       internal
     }
 
@@ -439,7 +449,7 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
 
         def emit(): Unit = {
           val node = makeNode(current.toSeq)
-          store.put(node)
+          put(node)
           emitted += node
           current.clear()
         }
@@ -544,15 +554,28 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
 //    `churnCost` tokens. Insert-then-delete is how someone probes for chunk boundaries
 //    without leaving the probes in the tree, so it is made expensive. It is tracked
 //    across clients, so inserting from one client and deleting from another doesn't help.
+//  - Every client also has a node budget: `nodeWritesPerSecond` refill, up to `nodeBurst`.
+//    Each committed batch is charged the nodes it actually wrote, after the fact, and a
+//    client in debt cannot write until the budget refills. Normally a datom rewrites about
+//    one node, but someone who knows the chunker key can craft a region with no content
+//    cuts, where every insert re-splits the whole region. Charging by nodes makes that
+//    amplification come out of the attacker's budget: per client, the tree does no more
+//    work than for an honest client writing at full rate.
+//  - A batch that writes at least `amplificationAlertMinNodes` nodes and more than
+//    `amplificationAlertRatio` nodes per datom raises an alert: a sign the key leaked.
 final case class WriteLimits(
                               datomsPerSecond: Double = 1000.0,
                               burst: Double = 5000.0,
                               churnWindowMs: Long = 60000L,
-                              churnCost: Double = 50.0
+                              churnCost: Double = 50.0,
+                              nodeWritesPerSecond: Double = 2000.0,
+                              nodeBurst: Double = 10000.0,
+                              amplificationAlertRatio: Double = 20.0,
+                              amplificationAlertMinNodes: Long = 100L
                             )
 
-class WriteRateLimiter(limits: WriteLimits, clock: () => Long = () => System.currentTimeMillis()) {
-  private final class Bucket(var tokens: Double, var lastRefillMs: Long)
+class WriteRateLimiter(val limits: WriteLimits, clock: () => Long = () => System.currentTimeMillis()) {
+  private final class Bucket(var tokens: Double, var nodeTokens: Double, var lastRefillMs: Long)
 
   private val buckets = mutable.Map[String, Bucket]()
   // Datoms inserted within the churn window, oldest first.
@@ -563,18 +586,32 @@ class WriteRateLimiter(limits: WriteLimits, clock: () => Long = () => System.cur
     val now = clock()
     forgetOldInserts(now)
 
-    val bucket = buckets.getOrElseUpdate(client, new Bucket(limits.burst, now))
-    bucket.tokens = math.min(limits.burst, bucket.tokens + (now - bucket.lastRefillMs) * limits.datomsPerSecond / 1000.0)
-    bucket.lastRefillMs = now
-
+    val bucket = refilled(client, now)
     val cost = inserts.length + deletes.map(d => if (recentInserts.contains(d)) limits.churnCost else 1.0).sum
-    if (cost > limits.burst) Long.MaxValue // can never fit; the batch must be split
-    else if (cost > bucket.tokens) math.ceil((cost - bucket.tokens) * 1000.0 / limits.datomsPerSecond).toLong
-    else {
+    if (cost > limits.burst) return Long.MaxValue // can never fit; the batch must be split
+
+    val datomWait = if (cost > bucket.tokens) math.ceil((cost - bucket.tokens) * 1000.0 / limits.datomsPerSecond).toLong else 0L
+    val nodeWait = if (bucket.nodeTokens < 0) math.ceil(-bucket.nodeTokens * 1000.0 / limits.nodeWritesPerSecond).toLong max 1L else 0L
+    val waitMs = datomWait max nodeWait
+    if (waitMs == 0L) {
       bucket.tokens -= cost
       inserts.foreach { d => recentInserts.remove(d); recentInserts.put(d, now) }
-      0L
     }
+    waitMs
+  }
+
+  /** Charges `client` for the nodes a committed batch wrote. The budget may go negative. */
+  def chargeNodes(client: String, nodes: Long): Unit = synchronized {
+    refilled(client, clock()).nodeTokens -= nodes
+  }
+
+  private def refilled(client: String, now: Long): Bucket = {
+    val bucket = buckets.getOrElseUpdate(client, new Bucket(limits.burst, limits.nodeBurst, now))
+    val elapsed = now - bucket.lastRefillMs
+    bucket.tokens = math.min(limits.burst, bucket.tokens + elapsed * limits.datomsPerSecond / 1000.0)
+    bucket.nodeTokens = math.min(limits.nodeBurst, bucket.nodeTokens + elapsed * limits.nodeWritesPerSecond / 1000.0)
+    bucket.lastRefillMs = now
+    bucket
   }
 
   private def forgetOldInserts(now: Long): Unit = {
@@ -590,29 +627,61 @@ object TxResult {
   final case class Rejected(reason: String) extends TxResult
 }
 
+// The current tree, shared by DatomDatabase (for clients) and DatomAdmin (for operators).
+// Never hand this to clients.
+final class DatabaseState(initialManager: DatomProllyTreeManager) {
+  var manager: DatomProllyTreeManager = initialManager
+  var root: ProllyNode = initialManager.emptyTree()
+}
+
 // The API to hand to untrusted clients. It exposes datoms only: no root or node hashes,
 // no nodes, node sizes, block counts or tree stats. Those reveal where chunks end,
 // which is exactly what someone probing for boundaries needs to observe. Writes go
 // through the rate limiter, and a rejected batch changes nothing.
-class DatomDatabase(manager: DatomProllyTreeManager, limiter: WriteRateLimiter) {
-  private var root: ProllyNode = manager.emptyTree()
+class DatomDatabase(state: DatabaseState, limiter: WriteRateLimiter, alert: String => Unit = _ => ()) {
 
-  def transact(client: String, inserts: Seq[Datom], deletes: Seq[Datom] = Nil): TxResult = synchronized {
-    try inserts.foreach(manager.chunker.validate)
+  def transact(client: String, inserts: Seq[Datom], deletes: Seq[Datom] = Nil): TxResult = state.synchronized {
+    try inserts.foreach(state.manager.chunker.validate)
     catch { case e: IllegalArgumentException => return TxResult.Rejected(e.getMessage) }
 
     limiter.acquire(client, inserts, deletes) match {
       case 0L =>
-        root = manager.applyBatch(root.hash, inserts, deletes)
+        val before = state.manager.nodesWritten
+        state.root = state.manager.applyBatch(state.root.hash, inserts, deletes)
+        val nodes = state.manager.nodesWritten - before
+        limiter.chargeNodes(client, nodes)
+
+        val datoms = inserts.length + deletes.length
+        val limits = limiter.limits
+        if (nodes >= limits.amplificationAlertMinNodes && nodes > limits.amplificationAlertRatio * (datoms max 1))
+          alert(s"Write amplification: client '$client' changed $datoms datoms and rewrote $nodes nodes. " +
+            "Crafted data like this needs the chunker key; consider DatomAdmin.rotateKey.")
         TxResult.Committed
       case Long.MaxValue => TxResult.Rejected("Batch is larger than the write burst limit; split it")
       case waitMs => TxResult.RateLimited(waitMs)
     }
   }
 
-  def entity(e: Long): Seq[Datom] = synchronized(manager.getEntityDatoms(root.hash, e))
-  def datoms: Seq[Datom] = synchronized(manager.getAllDatoms(root.hash))
-  def count: Long = synchronized(manager.countDatoms(root.hash))
+  def entity(e: Long): Seq[Datom] = state.synchronized(state.manager.getEntityDatoms(state.root.hash, e))
+  def datoms: Seq[Datom] = state.synchronized(state.manager.getAllDatoms(state.root.hash))
+  def count: Long = state.synchronized(state.manager.countDatoms(state.root.hash))
+}
+
+// Operator-only controls. Not part of the client API.
+class DatomAdmin(state: DatabaseState) {
+
+  // Rebuilds the tree under a new chunker key (same settings) with a bulk load. Data
+  // crafted against the old key becomes ordinary data, so any cut-avoiding region stops
+  // amplifying writes. Costs one full rebuild. The new tree goes into a fresh store, so
+  // past versions are dropped. Persist the new key with the tree.
+  def rotateKey(newKey: ChunkerKey): Unit = state.synchronized {
+    val old = state.manager
+    val c = old.chunker
+    val chunker = new DatomFastCDC(newKey, c.minKeys, c.avgBytes, c.maxBytes, c.targetBranchingFactor, c.maxKeys, c.maxDatomBytes)
+    val manager = new DatomProllyTreeManager(new KVStore(), chunker)
+    state.root = manager.buildInitialTree(old.getAllDatoms(state.root.hash))
+    state.manager = manager
+  }
 }
 
 // ==========================================

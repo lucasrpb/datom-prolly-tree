@@ -97,7 +97,7 @@ sbt test                                 # property test
 * an attacker with a leaked key can force `minKeys`-sized leaves, but no smaller;
 * no node ever exceeds `maxKeys` or `maxBytes`, including under tight limits where most cuts are forced (still equal to a bulk load), and when an attacker with the key crafts datoms that never trigger a content cut.
 
-`src/test/scala/index/UntrustedAccessSpec.scala` covers the rate limiter (burst, refill, per-client buckets, churn charged across clients), a probing loop throttled to under 200 probes a minute, `DatomDatabase` commits and rejections, and that its API exposes no hashes, nodes or store.
+`src/test/scala/index/UntrustedAccessSpec.scala` covers the rate limiter (burst, refill, per-client buckets, churn charged across clients), a probing loop throttled to under 200 probes a minute, `DatomDatabase` commits and rejections, that its API exposes no hashes, nodes or store, node-budget debt, a leaked-key amplification attack (throttled to the node budget, alerted, and ended by key rotation), and that an honest client at full rate never hits the node budget.
 
 ## Hardening
 
@@ -110,6 +110,10 @@ To fragment the tree on purpose, an attacker has to predict which datoms end a n
   * **Rate-limited writes.** `WriteRateLimiter` gives each client a token bucket (default 1,000 datoms/s, burst 5,000); each inserted or deleted datom costs 1.
   * **Churn charge.** Deleting a datom inserted less than `churnWindowMs` ago (default 60 s), by any client, costs `churnCost` tokens (default 50). An insert-then-delete probing loop drops from about 3,500 to under 200 probes a minute with the test limits.
   * **All or nothing.** A rejected or rate-limited batch changes nothing.
+* **Leaked-key write amplification.** The hard limits cannot stop someone holding the key: they can craft a region with no content cuts, where every split is forced by `maxKeys` and so depends on position. One datom inserted at the front of such a region then re-splits all of it (measured: 200 blocks per 1-datom insert for a 50,000-datom region, against 3 normally). Three defences:
+  * **Node budget.** Each client also has a budget of nodes written (default 2,000/s, burst 10,000). A committed batch is charged the nodes it actually wrote, and a client in debt cannot write until it refills. The amplification comes out of the attacker's own budget, so per client the tree never does more work than for an honest client writing at full rate. In the test, a minute of attack gets 264 inserts through at 121 nodes each (32,049 nodes, the budget), and an honest client writing 1,000 scattered datoms a second never hits it.
+  * **Alert.** A batch writing at least 100 nodes and more than 20 per datom calls the `alert` hook given to `DatomDatabase`. Honest writes rewrite about one node per datom, so this means the key has most likely leaked.
+  * **Key rotation.** `DatomAdmin.rotateKey(newKey)`, an operator-only handle kept apart from `DatomDatabase`, rebuilds the tree under a new key with a bulk load. The crafted region becomes ordinary data: in the test the same insert then writes 3 nodes instead of 121.
 * **Hard size bounds.** `maxKeys` and `maxBytes` are never exceeded, even by an attacker holding the key who avoids every content cut; such nodes just fill up to a limit (tested). A content cut needs at least `minKeys` items, so a node smaller than that exists only as the last one on a level, or when its next item would break `maxBytes`. Even an attacker holding the key can shrink leaves only to `minKeys` datoms (with `minKeys = 35`, about 2.4x more leaves than the normal average of 82 datoms, down from about 7x with `minKeys = 10`).
 
 ## Data Integrity
@@ -127,5 +131,6 @@ Any change to any datom changes every hash on its path to the root, so a root ha
 * **Memory only, no garbage collection.** `KVStore` is an in-memory map and keeps every node ever written. Most of the 1.19M blocks the benchmark mints are superseded leaf versions that stay only because every past root remains readable.
 * **Insert walks the node index.** `insertBatch` lists the nodes of every level before re-chunking. That is a pointer walk with no hashing, but it is proportional to the tree's node count rather than to the batch.
 * **Timing is still observable.** `DatomDatabase` hides hashes, nodes and block counts, but how long a write takes still hints at how many nodes it rewrote. Anyone who can time writes precisely could still learn something about boundaries. The keyed hash keeps that knowledge from carrying over to other datoms, and the churn charge makes collecting it slow.
+* **Limits are per client.** An attacker with many client identities multiplies their budgets; a global node budget, or tying clients to accounts, would be needed on top. Key rotation also drops past versions (the new tree goes into a fresh store).
 * **Limits live in memory.** `WriteRateLimiter` state resets on restart and is per process. With several writers, the limits would need a shared store.
 * **Deletes are physical.** `deleteBatch` removes a datom from the index; it is separate from recording a retraction as a datom with `op = false`.
