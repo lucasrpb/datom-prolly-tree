@@ -8,8 +8,9 @@ Node boundaries come from content-defined chunking (CDC), and every node is addr
 
 Records are `Datom(e, a, v, t, op)` tuples kept in EAVT order. Leaves hold datoms; internal nodes hold `(firstKey, childHash)` pointers. Instead of fixed node sizes, a keyed hash of each item decides where one node ends and the next begins:
 
-* **Leaves** are cut on datom boundaries using `SipHash-2-4(key, datom)`. Each datom gets a cut chance proportional to its size (`datomBytes / avgBytes`), halved while the chunk is below `avgBytes` and doubled above it (FastCDC-style normalization), bounded by `minKeys` and `maxBytes`.
-* **Internal nodes** are cut using `SipHash-2-4(key, childHash)`, targeting `targetBranchingFactor` children, bounded by `minKeys` and `maxKeysPerInternalNode`.
+* **Leaves** are cut on datom boundaries using `SipHash-2-4(key, datom)`. Each datom gets a cut chance proportional to its size (`datomBytes / avgBytes`), halved while the chunk is below `avgBytes` and doubled above it (FastCDC-style normalization).
+* **Internal nodes** are cut using `SipHash-2-4(key, childHash)`, targeting `targetBranchingFactor` children.
+* **Hard limits, for every node:** a node closes *before* the item that would take it past `maxKeys` items or `maxBytes` bytes, whatever the hash says, so no node ever exceeds either. Node bytes are the sum of its items: `Datom.sizeInBytes` per datom in a leaf, key size plus child hash length per pointer in an internal node. Content-defined cuts are only considered once a node has `minKeys` items.
 
 ### History independence
 
@@ -57,7 +58,7 @@ The demo verifies that:
 
 ### Results
 
-Chunker settings: `minKeys = 10, avgBytes = 2048, maxBytes = 8192, targetBranchingFactor = 64`.
+The table compares the two implementations with `minKeys = 10, avgBytes = 2048, maxBytes = 8192, targetBranchingFactor = 64`. The demo now uses `minKeys = 35, maxKeys = 256, maxBytes = 16384` (see below).
 
 | | Before the fix | After the fix |
 |---|---|---|
@@ -72,7 +73,11 @@ Chunker settings: `minKeys = 10, avgBytes = 2048, maxBytes = 8192, targetBranchi
 
 Deleting 235,020 datoms in 492 batches takes 6.6 s (~36k datoms/s). After the deletes, leaves still average 70 datoms (~2.4 KB) and internal nodes 72 children: shrinking does not fragment the tree either.
 
-The "after" numbers use the keyed SipHash chunker. Hashing each datom with SipHash costs more than the previous unkeyed hash; with it the batches took 17.2 s instead of 22.1 s.
+The "after" numbers use the keyed SipHash chunker. Hashing each datom with SipHash costs more than the previous unkeyed hash, which took 17.2 s for the same batches.
+
+**With `minKeys = 35`** (half the ~70 datoms of a typical leaf), the follow batches take 19.6 s (p50 9 ms, p99 24 ms) and the deletes 6.2 s. After the deletes, leaves average 82 datoms (~2.8 KB) and internal nodes 83 children, with 4 levels. The higher floor makes nodes a little larger on average, and it cuts the worst case: no leaf except the last can hold fewer than 35 datoms.
+
+**With hard limits `maxKeys = 256`, `maxBytes = 16384`** on every node, the follow batches take 20.4 s (p50 10 ms, p99 27 ms) and the deletes 6.4 s, with 4 levels. The largest leaf has 256 datoms, and the largest internal node 168 children, at 16,370 bytes including its own 64-byte hash. A few of the 114 internal nodes (the p99 is already 16,360 bytes) end at the byte limit, because pointers are large (~97 bytes, mostly the hex child hash).
 
 ## Running
 
@@ -89,7 +94,8 @@ sbt test                                 # property test
 * 40,000 deletes in small batches leave no leaf below `minKeys`;
 * oversized datoms are rejected and leave the store untouched;
 * an attacker without the key who probes with inserts and deletes and then reuses what it learned cannot shrink leaves;
-* an attacker with a leaked key can force `minKeys`-sized leaves, but no smaller.
+* an attacker with a leaked key can force `minKeys`-sized leaves, but no smaller;
+* no node ever exceeds `maxKeys` or `maxBytes`, including under tight limits where most cuts are forced (still equal to a bulk load), and when an attacker with the key crafts datoms that never trigger a content cut.
 
 `src/test/scala/index/UntrustedAccessSpec.scala` covers the rate limiter (burst, refill, per-client buckets, churn charged across clients), a probing loop throttled to under 200 probes a minute, `DatomDatabase` commits and rejections, and that its API exposes no hashes, nodes or store.
 
@@ -104,7 +110,7 @@ To fragment the tree on purpose, an attacker has to predict which datoms end a n
   * **Rate-limited writes.** `WriteRateLimiter` gives each client a token bucket (default 1,000 datoms/s, burst 5,000); each inserted or deleted datom costs 1.
   * **Churn charge.** Deleting a datom inserted less than `churnWindowMs` ago (default 60 s), by any client, costs `churnCost` tokens (default 50). An insert-then-delete probing loop drops from about 3,500 to under 200 probes a minute with the test limits.
   * **All or nothing.** A rejected or rate-limited batch changes nothing.
-* **Hard size bounds.** A cut needs at least `minKeys` items, so no node except the last one on each level has fewer. Even an attacker holding the key can shrink leaves only to `minKeys` datoms (about 7x more leaves than normal with the demo settings), and `maxBytes` / `maxKeysPerInternalNode` cap node size.
+* **Hard size bounds.** `maxKeys` and `maxBytes` are never exceeded, even by an attacker holding the key who avoids every content cut; such nodes just fill up to a limit (tested). A content cut needs at least `minKeys` items, so a node smaller than that exists only as the last one on a level, or when its next item would break `maxBytes`. Even an attacker holding the key can shrink leaves only to `minKeys` datoms (with `minKeys = 35`, about 2.4x more leaves than the normal average of 82 datoms, down from about 7x with `minKeys = 10`).
 
 ## Data Integrity
 

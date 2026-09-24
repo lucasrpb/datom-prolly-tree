@@ -2,7 +2,7 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class UntrustedAccessSpec extends AnyFunSuite {
 
-  private val chunker = new DatomFastCDC(ChunkerKey(1L, 2L), minKeys = 10, avgBytes = 2048, maxBytes = 8192, targetBranchingFactor = 64)
+  private val chunker = new DatomFastCDC(ChunkerKey(1L, 2L), minKeys = 35, avgBytes = 2048, maxBytes = 16384, targetBranchingFactor = 64, maxKeys = 256)
   private val limits = WriteLimits(datomsPerSecond = 100.0, burst = 1000.0, churnWindowMs = 60000L, churnCost = 50.0)
 
   private class FakeClock(var nowMs: Long = 0L) { def apply(): Long = nowMs }

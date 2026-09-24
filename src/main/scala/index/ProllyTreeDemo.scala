@@ -140,9 +140,15 @@ class DatomFastCDC(
                     val avgBytes: Int = 16384,
                     val maxBytes: Int = 131072,
                     val targetBranchingFactor: Int = 512,
-                    val maxKeysPerInternalNode: Int = 4096,
+                    val maxKeys: Int = 4096,
                     val maxDatomBytes: Int = -1
                   ) {
+
+  // maxKeys and maxBytes are hard limits for every node, leaf or internal: a node is
+  // closed before the item that would take it past either one, whatever the PRF says.
+  // Node bytes are the sum of item sizes: Datom.sizeInBytes for a leaf datom, the key's
+  // size plus the child hash length for an internal pointer.
+  require(minKeys >= 1 && minKeys <= maxKeys, s"minKeys ($minKeys) must be between 1 and maxKeys ($maxKeys)")
 
   // Datoms larger than this are rejected. Kept well below maxBytes so that almost every
   // leaf ends at a content-defined cut rather than at the size cap.
@@ -191,56 +197,59 @@ class DatomFastCDC(
   // reset after every cut, so a boundary depends only on the items since the previous one.
   // That makes chunking a pure function of the item sequence (history independence)
   // and lets an incremental update stop once it re-aligns with an old boundary.
-  trait Cutter[T] {
-    /** Adds an item to the current chunk; returns true if the chunk ends after it. */
-    def offer(item: T): Boolean
-  }
-
-  def newLeafCutter(): Cutter[Datom] = new Cutter[Datom] {
+  //
+  // For each item, callers first ask `fits`: if the current chunk is non-empty and the
+  // item would break maxKeys or maxBytes, the chunk ends before it (`reset`). Then
+  // `offer` adds it and says whether the chunk ends after it: at a content-defined cut
+  // (once minKeys is reached) or because a hard limit is now exactly reached.
+  abstract class Cutter[T] {
     private var keys = 0
     private var bytes = 0
 
-    override def offer(datom: Datom): Boolean = {
+    protected def itemBytes(item: T): Int
+    protected def contentCut(item: T, keys: Int, bytes: Int): Boolean
+
+    def fits(item: T): Boolean = keys == 0 || (keys < maxKeys && bytes + itemBytes(item) <= maxBytes)
+
+    def offer(item: T): Boolean = {
       keys += 1
-      bytes += Datom.sizeInBytes(datom)
-
-      val cut =
-        if (bytes >= maxBytes) true
-        else if (keys >= minKeys) cutsLeaf(datom, bytes)
-        else false
-
-      if (cut) { keys = 0; bytes = 0 }
+      bytes += itemBytes(item)
+      val cut = keys >= maxKeys || bytes >= maxBytes || (keys >= minKeys && contentCut(item, keys, bytes))
+      if (cut) reset()
       cut
     }
+
+    def reset(): Unit = { keys = 0; bytes = 0 }
+  }
+
+  def newLeafCutter(): Cutter[Datom] = new Cutter[Datom] {
+    override protected def itemBytes(datom: Datom): Int = Datom.sizeInBytes(datom)
+    override protected def contentCut(datom: Datom, keys: Int, bytes: Int): Boolean = cutsLeaf(datom, bytes)
   }
 
   def newInternalCutter(): Cutter[(Datom, String)] = new Cutter[(Datom, String)] {
-    private var keys = 0
-
-    override def offer(child: (Datom, String)): Boolean = {
-      keys += 1
-
-      val cut =
-        if (keys >= maxKeysPerInternalNode) true
-        else if (keys >= minKeys)
-          (SipHash24.hash(key, child._2.getBytes("UTF-8")) >>> 32) < internalCutThreshold(keys)
-        else false
-
-      if (cut) keys = 0
-      cut
-    }
+    override protected def itemBytes(child: (Datom, String)): Int = Datom.sizeInBytes(child._1) + child._2.length
+    override protected def contentCut(child: (Datom, String), keys: Int, bytes: Int): Boolean =
+      (SipHash24.hash(key, child._2.getBytes("UTF-8")) >>> 32) < internalCutThreshold(keys)
   }
 
   private def chunk[T](items: Iterator[T], cutter: Cutter[T]): Iterator[Seq[T]] = new Iterator[Seq[T]] {
-    override def hasNext: Boolean = items.hasNext
+    private val pending = items.buffered
+
+    override def hasNext: Boolean = pending.hasNext
 
     override def next(): Seq[T] = {
       val currentChunk = mutable.ArrayBuffer[T]()
       var makeCut = false
-      while (items.hasNext && !makeCut) {
-        val item = items.next()
-        currentChunk += item
-        makeCut = cutter.offer(item)
+      while (pending.hasNext && !makeCut) {
+        if (!cutter.fits(pending.head)) {
+          cutter.reset()
+          makeCut = true
+        } else {
+          val item = pending.next()
+          currentChunk += item
+          makeCut = cutter.offer(item)
+        }
       }
       currentChunk.toSeq
     }
@@ -438,6 +447,10 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
         var aligned = false
         while (!aligned) {
           contents(i).foreach { item =>
+            if (!cutter.fits(item)) {
+              emit()
+              cutter.reset()
+            }
             current += item
             if (cutter.offer(item)) emit()
           }
@@ -445,8 +458,14 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
           if (i == count) {
             if (current.nonEmpty) emit()
             aligned = true
-          } else if (current.isEmpty && !dirty(i)) {
-            aligned = true
+          } else if (!dirty(i)) {
+            // Aligned if the chunk just ended, or if it must end before the next clean
+            // node's first item because a hard limit would be broken.
+            if (current.nonEmpty && !cutter.fits(contents(i).head)) {
+              emit()
+              cutter.reset()
+            }
+            aligned = current.isEmpty
           }
         }
         out(start) = emitted.toSeq
@@ -722,7 +741,7 @@ object ProllyTreeDemo extends App {
     sorted((sorted.length * pct).toInt min (sorted.length - 1))
 
   val store = new KVStore()
-  val chunker = new DatomFastCDC(ChunkerKey.random(), minKeys = 10, avgBytes = 2048, maxBytes = 8192, targetBranchingFactor = 64)
+  val chunker = new DatomFastCDC(ChunkerKey.random(), minKeys = 35, avgBytes = 2048, maxBytes = 16384, targetBranchingFactor = 64, maxKeys = 256)
   val manager = new DatomProllyTreeManager(store, chunker)
 
   println(s"1. Preparing workload file $CsvPath...")
@@ -887,8 +906,8 @@ object ProllyTreeDemo extends App {
       def avg(arr: Seq[Int]): Double = arr.sum.toDouble / arr.length
 
       println(s"\n--- $name STATS (${subset.length} nodes) ---")
-      println(f"Num of Keys -> Avg: ${avg(keys)}%6.1f | p50: ${p(keys, 0.50)}%4d | p70: ${p(keys, 0.70)}%4d | p90: ${p(keys, 0.90)}%4d | p99: ${p(keys, 0.99)}%4d")
-      println(f"Node size   -> Avg: ${avg(bytes)}%6.1f | p50: ${p(bytes, 0.50)}%4d | p70: ${p(bytes, 0.70)}%4d | p90: ${p(bytes, 0.90)}%4d | p99: ${p(bytes, 0.99)}%4d")
+      println(f"Num of Keys -> Avg: ${avg(keys)}%6.1f | p50: ${p(keys, 0.50)}%4d | p70: ${p(keys, 0.70)}%4d | p90: ${p(keys, 0.90)}%4d | p99: ${p(keys, 0.99)}%4d | max: ${keys.last}%4d")
+      println(f"Node size   -> Avg: ${avg(bytes)}%6.1f | p50: ${p(bytes, 0.50)}%4d | p70: ${p(bytes, 0.70)}%4d | p90: ${p(bytes, 0.90)}%4d | p99: ${p(bytes, 0.99)}%4d | max: ${bytes.last}%4d")
     }
 
     println("\n==========================================")

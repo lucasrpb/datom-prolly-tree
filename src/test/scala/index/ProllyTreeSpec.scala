@@ -6,7 +6,7 @@ import scala.util.Random
 class ProllyTreeSpec extends AnyFunSuite {
 
   private val key = ChunkerKey(0x1234567890abcdefL, 0x0fedcba987654321L)
-  private val chunker = new DatomFastCDC(key, minKeys = 10, avgBytes = 2048, maxBytes = 8192, targetBranchingFactor = 64)
+  private val chunker = new DatomFastCDC(key, minKeys = 35, avgBytes = 2048, maxBytes = 16384, targetBranchingFactor = 64, maxKeys = 256)
 
   private def newManager() = new DatomProllyTreeManager(new KVStore(), chunker)
 
@@ -21,6 +21,24 @@ class ProllyTreeSpec extends AnyFunSuite {
     }
 
   private def bulkRoot(datoms: Seq[Datom]): String = newManager().buildInitialTree(datoms).hash
+
+  private def allNodes(manager: DatomProllyTreeManager, rootHash: String): Seq[ProllyNode] =
+    manager.store.get(rootHash) match {
+      case leaf: LeafNode => Seq(leaf)
+      case internal: InternalNode => internal +: internal.children.flatMap(c => allNodes(manager, c._2))
+    }
+
+  // Keys and bytes as the hard limits count them (item sizes, without the node's own hash).
+  private def keysAndBytes(node: ProllyNode): (Int, Int) = node match {
+    case l: LeafNode => (l.datoms.length, l.datoms.map(Datom.sizeInBytes).sum)
+    case i: InternalNode => (i.children.length, i.children.map { case (k, h) => Datom.sizeInBytes(k) + h.length }.sum)
+  }
+
+  private def assertWithinLimits(manager: DatomProllyTreeManager, rootHash: String, cdc: DatomFastCDC, clue: String): Unit =
+    allNodes(manager, rootHash).foreach { n =>
+      val (keys, bytes) = keysAndBytes(n)
+      assert(keys <= cdc.maxKeys && bytes <= cdc.maxBytes, s"$clue: node with $keys keys, $bytes bytes")
+    }
 
   test("SipHash-2-4 matches the reference test vector") {
     // Key 00..0f, message 00..0e, from the SipHash paper.
@@ -59,6 +77,7 @@ class ProllyTreeSpec extends AnyFunSuite {
       val expected = all.sorted
       assert(manager.getAllDatoms(root.hash) == expected, s"seed $seed: contents")
       assert(root.hash == bulkRoot(expected), s"seed $seed: root differs from bulk load")
+      assertWithinLimits(manager, root.hash, chunker, s"seed $seed")
       history.foreach { case (hash, datoms) =>
         assert(manager.getAllDatoms(hash) == datoms, s"seed $seed: an old root was mutated")
       }
@@ -185,6 +204,51 @@ class ProllyTreeSpec extends AnyFunSuite {
     assert(sizes.forall(_ == chunker.minKeys), s"sizes: ${sizes.distinct}")
     // ...but it cannot go below minKeys, so the damage is bounded.
     assert(attacked.length <= crafted.length / chunker.minKeys + 1)
+    assert(root.hash == bulkRoot(honest ++ crafted))
+  }
+
+  test("with tight hard limits most cuts are forced, and the tree still matches a bulk load") {
+    // Content cuts are rare with these settings, so maxKeys and maxBytes decide most boundaries.
+    val tight = new DatomFastCDC(key, minKeys = 4, avgBytes = 2048, maxBytes = 700, targetBranchingFactor = 64, maxKeys = 16)
+    for (seed <- 1 to 20) {
+      val rnd = new Random(seed)
+      val manager = new DatomProllyTreeManager(new KVStore(), tight)
+      var all = Vector.fill(1 + rnd.nextInt(3000))(randomDatom(rnd, 3000)).distinct
+      var root = manager.buildInitialTree(all)
+      for (_ <- 1 to 1 + rnd.nextInt(30)) {
+        val inserts = Vector.fill(rnd.nextInt(500))(randomDatom(rnd, 3000))
+        val deletes = rnd.shuffle(all).take(rnd.nextInt(all.length / 3 + 1))
+        root = manager.applyBatch(root.hash, inserts, deletes)
+        all = (all ++ inserts).distinct.filterNot(deletes.toSet)
+      }
+      assert(manager.getAllDatoms(root.hash) == all.sorted, s"seed $seed: contents")
+      assert(root.hash == new DatomProllyTreeManager(new KVStore(), tight).buildInitialTree(all).hash, s"seed $seed: bulk")
+      assertWithinLimits(manager, root.hash, tight, s"seed $seed")
+    }
+  }
+
+  test("an attacker with the key who avoids every content cut only fills nodes up to the hard limits") {
+    val manager = newManager()
+    var root = manager.buildInitialTree(honest)
+    val rnd = new Random(8)
+
+    // Datoms that never trigger a content cut, even with the looser above-average threshold.
+    val attackBase = 4000000L
+    val crafted = Vector.tabulate(20000) { i =>
+      Iterator.continually(Datom(attackBase + i, 10L, s"n${rnd.nextInt()}", 3L, op = true))
+        .find(d => !chunker.cutsLeaf(d, chunkBytes = chunker.avgBytes)).get
+    }
+    root = manager.insertBatch(root.hash, crafted)
+
+    val attacked = leavesIn(manager, root.hash, attackBase, attackBase + 20000).init
+    assert(attacked.nonEmpty)
+    attacked.foreach { leaf =>
+      val (keys, bytes) = keysAndBytes(leaf)
+      assert(keys <= chunker.maxKeys && bytes <= chunker.maxBytes)
+      // Every leaf ends because a hard limit was reached.
+      assert(keys == chunker.maxKeys || bytes + 64 > chunker.maxBytes, s"leaf with $keys keys, $bytes bytes")
+    }
+    assertWithinLimits(manager, root.hash, chunker, "attacked tree")
     assert(root.hash == bulkRoot(honest ++ crafted))
   }
 }
