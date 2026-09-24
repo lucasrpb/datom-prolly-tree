@@ -1,38 +1,125 @@
 # Prolly Tree Datom Engine
 
-A production-grade, in-memory implementation of a Prolly Tree (Probabilistic B-Tree) written in Scala. This engine is designed to store massively scalable, immutable Datom (Entity-Attribute-Value-Time) datasets with Git-like versioning capabilities. 
+An in-memory Prolly Tree (probabilistic B-tree) in Scala that stores immutable Datoms (Entity-Attribute-Value-Time) with Git-like versioning. Every version of the tree is a root hash; old roots stay readable forever, and new versions share every unchanged node with the old ones.
 
-By leveraging Content-Defined Chunking (CDC) and Merkle DAG architecture, this tree provides the read performance of a B-Tree alongside the distributed synchronization and structural sharing properties of a Merkle Tree.
+Node boundaries come from content-defined chunking (CDC), and every node is addressed by its SHA-256 hash, so the tree is both a search tree and a Merkle DAG.
 
 ## Core Architecture
 
-The engine stores records as `Datom(e, a, v, t, op)` tuples, sorted strictly in EAVT order. Instead of relying on rigid, deterministic node sizes (like a standard B-Tree), it utilizes **FastCDC (Fast Content-Defined Chunking)** to dynamically determine node boundaries based purely on the cryptographic entropy of the data itself.
+Records are `Datom(e, a, v, t, op)` tuples kept in EAVT order. Leaves hold datoms; internal nodes hold `(firstKey, childHash)` pointers. Instead of fixed node sizes, a keyed hash of each item decides where one node ends and the next begins:
 
-Because boundaries are determined by content rather than insertion order, two identical datasets will mathematically guarantee the exact same tree structure and Root Hash, regardless of how or when the data was inserted. This eliminates the boundary-shift problem found in standard B-Trees and enables $O(\log N)$ historical diffing and merging.
+* **Leaves** are cut on datom boundaries using `SipHash-2-4(key, datom)`. Each datom gets a cut chance proportional to its size (`datomBytes / avgBytes`), halved while the chunk is below `avgBytes` and doubled above it (FastCDC-style normalization), bounded by `minKeys` and `maxBytes`.
+* **Internal nodes** are cut using `SipHash-2-4(key, childHash)`, targeting `targetBranchingFactor` children, bounded by `minKeys` and `maxKeysPerInternalNode`.
 
-## Why It Is Efficient
+### History independence
 
-* **$O(\log N)$ Structural Sharing:** The tree is fully immutable. Batch updates rely on path-copying. Modifying a leaf node only requires minting a new path of hashes up to the root. A batch insert of 1,000 records into a 10-million record tree mints only a handful of new blocks, while perfectly sharing 99.9% of the existing tree structure in memory.
-* **Shallow Traversal Depth:** Tuned with wide branching factors (e.g., target 512 keys per internal node), a dataset of 10 million records is consistently packed into a maximum depth of just 3 network hops.
-* **Localized Re-Chunking:** During a batch insert, the `DatomProllyTreeManager` routes incoming datoms only to the specifically affected subtrees. The FastCDC algorithm only re-chunks the merged data within those specific leaves, bypassing the need to recalculate boundaries for the rest of the database.
+The chunker's state (item and byte counts) is **reset after every cut**, so a boundary depends only on the items since the previous boundary. Chunking is therefore a pure function of the sorted datom sequence: **the same set of datoms always produces the same tree and the same root hash, no matter how many batches, inserts or deletes produced it.** A bulk load and a million incremental updates converge on the identical structure.
 
-## Why It Is Safe (Production Hardening)
+This is what makes cheap diffing and syncing possible: two trees can be compared top-down, and any subtree with the same hash is known to be identical without looking inside.
 
-Probabilistically structured databases are uniquely vulnerable to structural degeneration (falling into deep spires or flat arrays) and algorithmic complexity attacks. This implementation implements three distinct mathematical safeguards to guarantee worst-case immunity:
+### Incremental inserts and deletes
 
-### 1. Adversarial Immunity (Secure Initialization)
-The rolling hash relies on a 256-byte gear matrix. If this matrix is predictable, an attacker can pre-calculate payloads that intentionally force worst-case chunk boundaries, triggering OOM crashes. This engine initializes the gear matrix using `java.security.SecureRandom()`, making the tree mathematically blind to targeted algorithmic DoS attacks.
+`DatomProllyTreeManager.applyBatch(root, inserts, deletes)` (with `insertBatch` and `deleteBatch` as shorthands) updates the tree level by level, bottom-up:
 
-### 2. Hash Starvation Prevention (Entropy Injection)
-Feeding raw, predictable data (like sequential IDs or repeating strings) into a rolling hash can cause mathematical cycles that fail to trigger probabilistic masks, degrading the tree into a rigid array. This engine strictly decouples meaning from entropy by passing every Datom through `scala.util.hashing.MurmurHash3` before FastCDC evaluation. This crushes the data into 64 bits of perfect, uniform pseudo-randomness, guaranteeing ideal chunk distribution regardless of payload patterns.
+1. Each inserted or deleted datom is routed to the leaf whose key range contains it. Deleting a datom that is not in the tree is a no-op.
+2. Only nodes whose content changed are re-chunked. Re-chunking starts at a known boundary (the start of the first changed node) with a fresh chunker and **keeps pulling in the following siblings until a cut lands exactly on an old node boundary**. From there on the old chunking is guaranteed to repeat, so every following node is reused as-is.
+3. The replaced nodes feed the same process one level up. The tree grows a level when the top level no longer fits in one node, and shrinks when a level collapses to one node. Deleting everything yields the empty tree (a single empty leaf).
 
-### 3. Statistical Padding for Probabilistic Balance
-Standard hybrid Prolly Trees fall back on physical circuit breakers (`maxBytes` or `maxKeys`) when probability fails, which breaks structural sharing. This engine employs an **8x Statistical Padding** strategy. By setting the physical guardrails (e.g., 4096 keys) massively wider than the target branching factor (e.g., 512 keys), the dual-mask (Strict/Loose) algorithm is statistically guaranteed to find a natural content-defined boundary before ever hitting a physical wall. 
+Deletes use the same re-synchronisation, so a leaf that shrinks is merged with its neighbours rather than left behind as a fragment.
+
+The earlier implementation re-chunked each touched leaf in isolation. The tail of every split had no real boundary and was never merged with its neighbour, so tiny leaves piled up with every batch and the tree's shape depended on insert order. Re-synchronising with the old boundaries fixes both problems.
+
+## Workload Benchmark
+
+`ProllyTreeDemo` runs a social-graph workload of **1,000,000 datoms** read from `1M_datoms.csv` (columns `e,a,v,t,op`). The file is generated with a fixed seed the first time the demo runs, and reused if it already exists.
+
+| Attribute (`Attributes.*`) | Id | Value | Datoms |
+|---|---|---|---|
+| `UserName` | 10 | String | 10,000 |
+| `UserAge` | 11 | Long (18–80) | 10,000 |
+| `UserEmail` | 12 | String | 10,000 |
+| `Follows` | 13 | Long (followee id) | 470,040 |
+| `LikesFruit` | 14 | String, 1–5 per user | 29,920 |
+| `FollowStartedAt` | 15 | Long (epoch ms) | 470,040 |
+
+* 10,000 users are bulk-loaded in transaction 1.
+* Follows are unique (no self-follows, no user follows the same user twice) and arrive in **1,833 batches of 10–1,000 datoms**, each its own transaction, each applied with `insertBatch`.
+* Each follow is two datoms: `follower Follows followee`, and `FollowStartedAt` on a follow-edge entity whose id is `followEdgeId(follower, followee)`.
+
+* 25% of the follow relationships are then deleted (both datoms of each) in 492 random batches of 10–1,000 datoms with `deleteBatch`.
+
+The demo verifies that:
+
+* the final root contains exactly the 1M datoms, in order;
+* the root saved after the users load (before any follows) still returns exactly the original user datoms;
+* bulk-loading all 1M datoms in one go yields the **same root hash** as the 1,833 incremental batches;
+* after the deletes, the tree holds exactly the remaining 764,980 datoms, matches a bulk load of them, and the pre-delete root is intact.
+
+### Results
+
+Chunker settings: `minKeys = 10, avgBytes = 2048, maxBytes = 8192, targetBranchingFactor = 64`.
+
+| | Before the fix | After the fix |
+|---|---|---|
+| Tree levels | 8 | **4** |
+| Leaves | 173,910 | **14,069** |
+| Datoms per leaf (median) | 2 | **69** |
+| Final tree size | 60.3 MB | **34.2 MB** |
+| Blocks minted by the batches | 2.28M | **1.19M** |
+| All follow batches | 21.1 s | **22.1 s** (~43k datoms/s) |
+| Batch latency p50 / p99 | 11 / 33 ms | **11 / 32 ms** |
+| Same root as a bulk load | not guaranteed | **yes (verified)** |
+
+Deleting 235,020 datoms in 492 batches takes 6.6 s (~36k datoms/s). After the deletes, leaves still average 70 datoms (~2.4 KB) and internal nodes 72 children: shrinking does not fragment the tree either.
+
+The "after" numbers use the keyed SipHash chunker. Hashing each datom with SipHash costs more than the previous unkeyed hash; with it the batches took 17.2 s instead of 22.1 s.
+
+## Running
+
+```bash
+sbt -J-Xmx16g "runMain ProllyTreeDemo"   # workload benchmark
+sbt test                                 # property test
+```
+
+`src/test/scala/index/ProllyTreeSpec.scala` covers:
+
+* SipHash-2-4 against the reference test vector;
+* 30 random histories mixing inserts and deletes (duplicates, keys before everything, deletes of whole ranges and of absent datoms): contents correct, root equal to a bulk load, every past root unchanged;
+* deleting everything (empty tree) and re-inserting (same root as before);
+* 40,000 deletes in small batches leave no leaf below `minKeys`;
+* oversized datoms are rejected and leave the store untouched;
+* an attacker without the key who probes with inserts and deletes and then reuses what it learned cannot shrink leaves;
+* an attacker with a leaked key can force `minKeys`-sized leaves, but no smaller.
+
+`src/test/scala/index/UntrustedAccessSpec.scala` covers the rate limiter (burst, refill, per-client buckets, churn charged across clients), a probing loop throttled to under 200 probes a minute, `DatomDatabase` commits and rejections, and that its API exposes no hashes, nodes or store.
+
+## Hardening
+
+To fragment the tree on purpose, an attacker has to predict which datoms end a node. The engine prevents that and bounds the damage if it fails:
+
+* **Keyed cut decisions.** Cuts are decided by SipHash-2-4, a keyed PRF, under a secret 128-bit `ChunkerKey`. Without the key, seeing any number of datoms and where nodes ended says nothing about new datoms, so the only way to find a datom that ends a node is to insert it. The decision depends on the whole datom, so a known cutter tells nothing about similar datoms either. `ChunkerKey.toString` is redacted to keep the key out of logs.
+* **Datom size limit.** Every inserted datom is validated before anything is written; one larger than `maxDatomBytes` (default `avgBytes / 4`, never above `maxBytes`) throws `IllegalArgumentException` and the batch is rejected. This keeps almost every leaf ending at a content-defined cut instead of the `maxBytes` cap.
+* **Untrusted access through `DatomDatabase`.** Deletes let an attacker test datoms without leaving them in the tree, so untrusted clients get a facade instead of the manager:
+  * **Datoms only.** It offers `transact`, `entity`, `datoms` and `count`. Root and node hashes, nodes, node sizes, block counts and tree stats are hidden, because those show where nodes end. A test checks by reflection that no public method returns them.
+  * **Rate-limited writes.** `WriteRateLimiter` gives each client a token bucket (default 1,000 datoms/s, burst 5,000); each inserted or deleted datom costs 1.
+  * **Churn charge.** Deleting a datom inserted less than `churnWindowMs` ago (default 60 s), by any client, costs `churnCost` tokens (default 50). An insert-then-delete probing loop drops from about 3,500 to under 200 probes a minute with the test limits.
+  * **All or nothing.** A rejected or rate-limited batch changes nothing.
+* **Hard size bounds.** A cut needs at least `minKeys` items, so no node except the last one on each level has fewer. Even an attacker holding the key can shrink leaves only to `minKeys` datoms (about 7x more leaves than normal with the demo settings), and `maxBytes` / `maxKeysPerInternalNode` cap node size.
 
 ## Data Integrity
 
-Every node in the tree is content-addressed using a strict **SHA-256 Merkle DAG**. 
-* **Leaves** hash the raw Datom byte buffers.
-* **Internal Nodes** hash the concatenated SHA-256 strings of their children.
+Every node is content-addressed with SHA-256:
 
-This guarantees that any silent data corruption, disk bit-rot, or unauthorized tampering instantly invalidates the Root Hash, providing cryptographic assurance of the entire historical state.
+* **Leaves** hash each datom's `e`, `a`, `t`, `op` and `v`.
+* **Internal nodes** hash the concatenated hashes of their children.
+
+Any change to any datom changes every hash on its path to the root, so a root hash identifies an entire version of the database.
+
+## Limitations
+
+* **The key must live as long as the tree.** The demo uses `ChunkerKey.random()`, so every run gets different root hashes. A persisted tree must be reopened with the same key: a tree split under another key (or other chunker settings) no longer re-synchronises, and updates would rewrite most of it. Changing the key means rebuilding with a bulk load. Keep one key per deployment and never share it across tenants, since anyone holding it can craft worst-case data.
+* **Memory only, no garbage collection.** `KVStore` is an in-memory map and keeps every node ever written. Most of the 1.19M blocks the benchmark mints are superseded leaf versions that stay only because every past root remains readable.
+* **Insert walks the node index.** `insertBatch` lists the nodes of every level before re-chunking. That is a pointer walk with no hashing, but it is proportional to the tree's node count rather than to the batch.
+* **Timing is still observable.** `DatomDatabase` hides hashes, nodes and block counts, but how long a write takes still hints at how many nodes it rewrote. Anyone who can time writes precisely could still learn something about boundaries. The keyed hash keeps that knowledge from carrying over to other datoms, and the churn charge makes collecting it slow.
+* **Limits live in memory.** `WriteRateLimiter` state resets on restart and is per process. With several writers, the limits would need a shared store.
+* **Deletes are physical.** `deleteBatch` removes a datom from the index; it is separate from recording a retraction as a datom with `op = false`.

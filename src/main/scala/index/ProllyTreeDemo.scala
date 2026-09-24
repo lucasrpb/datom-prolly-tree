@@ -3,7 +3,6 @@ import java.security.{MessageDigest, SecureRandom}
 import java.nio.ByteBuffer
 import scala.collection.mutable
 import scala.io.Source
-import scala.util.hashing.MurmurHash3
 
 // ==========================================
 // 1. DOMAIN & DATA STRUCTURES
@@ -78,115 +77,179 @@ class KVStore {
 // 3. FAST-CDC CHUNKER
 // ==========================================
 
+// Secret key for chunk-boundary decisions. It must stay the same for the life of a tree
+// (persist it with the tree) and must never be exposed: whoever knows it can craft data
+// that forces worst-case node sizes.
+final case class ChunkerKey(k0: Long, k1: Long) {
+  override def toString: String = "ChunkerKey(<redacted>)"
+}
+
+object ChunkerKey {
+  def random(): ChunkerKey = {
+    val rng = new SecureRandom()
+    ChunkerKey(rng.nextLong(), rng.nextLong())
+  }
+}
+
+// SipHash-2-4: a keyed PRF, so without the key nobody can predict its output, even
+// after seeing many input/output pairs.
+object SipHash24 {
+  private final class State(k0: Long, k1: Long) {
+    var v0: Long = 0x736f6d6570736575L ^ k0
+    var v1: Long = 0x646f72616e646f6dL ^ k1
+    var v2: Long = 0x6c7967656e657261L ^ k0
+    var v3: Long = 0x7465646279746573L ^ k1
+
+    def round(): Unit = {
+      v0 += v1; v1 = java.lang.Long.rotateLeft(v1, 13); v1 ^= v0; v0 = java.lang.Long.rotateLeft(v0, 32)
+      v2 += v3; v3 = java.lang.Long.rotateLeft(v3, 16); v3 ^= v2
+      v0 += v3; v3 = java.lang.Long.rotateLeft(v3, 21); v3 ^= v0
+      v2 += v1; v1 = java.lang.Long.rotateLeft(v1, 17); v1 ^= v2; v2 = java.lang.Long.rotateLeft(v2, 32)
+    }
+
+    def compress(m: Long): Unit = {
+      v3 ^= m; round(); round(); v0 ^= m
+    }
+  }
+
+  def hash(key: ChunkerKey, data: Array[Byte]): Long = {
+    val s = new State(key.k0, key.k1)
+    val fullBlocks = data.length / 8
+    var i = 0
+    while (i < fullBlocks) {
+      var m = 0L
+      var b = 7
+      while (b >= 0) { m = (m << 8) | (data(i * 8 + b) & 0xFFL); b -= 1 }
+      s.compress(m)
+      i += 1
+    }
+    var last = (data.length & 0xFFL) << 56
+    var b = data.length - fullBlocks * 8 - 1
+    while (b >= 0) { last |= (data(fullBlocks * 8 + b) & 0xFFL) << (8 * b); b -= 1 }
+    s.compress(last)
+
+    s.v2 ^= 0xFF
+    s.round(); s.round(); s.round(); s.round()
+    s.v0 ^ s.v1 ^ s.v2 ^ s.v3
+  }
+}
+
 class DatomFastCDC(
+                    val key: ChunkerKey,
                     val minKeys: Int = 32,
                     val avgBytes: Int = 16384,
                     val maxBytes: Int = 131072,
                     val targetBranchingFactor: Int = 512,
-                    val maxKeysPerInternalNode: Int = 4096
+                    val maxKeysPerInternalNode: Int = 4096,
+                    val maxDatomBytes: Int = -1
                   ) {
 
-  private val gearMatrix: Array[Long] = {
-    val rng = new SecureRandom()
-    Array.fill(256)(rng.nextLong())
+  // Datoms larger than this are rejected. Kept well below maxBytes so that almost every
+  // leaf ends at a content-defined cut rather than at the size cap.
+  val datomSizeLimit: Int = if (maxDatomBytes > 0) maxDatomBytes else avgBytes / 4
+  require(datomSizeLimit <= maxBytes, s"maxDatomBytes ($datomSizeLimit) must not exceed maxBytes ($maxBytes)")
+
+  def validate(datom: Datom): Unit = {
+    val size = Datom.sizeInBytes(datom)
+    if (size > datomSizeLimit)
+      throw new IllegalArgumentException(
+        s"Datom (e=${datom.e}, a=${datom.a}) is $size bytes; the limit is $datomSizeLimit bytes")
   }
 
-  private val bits = (Math.log(avgBytes.toDouble) / Math.log(2)).ceil.toInt
-  private val maskS: Long = (1L << (bits + 1)) - 1
-  private val maskL: Long = (1L << (bits - 1)) - 1
-
-  private val internalBits = (Math.log(targetBranchingFactor.toDouble) / Math.log(2)).ceil.toInt
-  private val internalMaskS: Long = (1L << (internalBits + 1)) - 1
-  private val internalMaskL: Long = (1L << (internalBits - 1)) - 1
-
-  @inline private def hashLong(value: Long, currentHash: Long): Long = {
-    var h = currentHash
-    var i = 7
-    while (i >= 0) {
-      val b = ((value >> (i * 8)) & 0xFF).toInt
-      h = (h << 1) + gearMatrix(b)
-      i -= 1
+  // Unambiguous byte encoding of a datom, fed to the PRF.
+  private def encode(d: Datom): Array[Byte] = {
+    val (tag, valueBytes) = d.v match {
+      case l: Long => (1.toByte, ByteBuffer.allocate(8).putLong(l).array())
+      case s: String => (2.toByte, s.getBytes("UTF-8"))
+      case other => (3.toByte, other.toString.getBytes("UTF-8"))
     }
-    h
+    ByteBuffer.allocate(26 + valueBytes.length)
+      .putLong(d.e).putLong(d.a).putLong(d.t)
+      .put((if (d.op) 1 else 0).toByte).put(tag).put(valueBytes)
+      .array()
   }
 
-  @inline private def preHashDatom(d: Datom): Long = {
-    var h1 = MurmurHash3.mix(0x9E3779B9, d.e.hashCode)
-    h1 = MurmurHash3.mix(h1, d.a.hashCode)
-    h1 = MurmurHash3.mix(h1, d.v.hashCode)
-    h1 = MurmurHash3.mix(h1, d.t.hashCode)
-    h1 = MurmurHash3.mixLast(h1, if (d.op) 1 else 0)
-    val out1 = MurmurHash3.finalizeHash(h1, 5)
-
-    var h2 = MurmurHash3.mix(0x1337C0DE, d.e.hashCode)
-    h2 = MurmurHash3.mix(h2, d.v.hashCode)
-    val out2 = MurmurHash3.finalizeHash(h2, 2)
-
-    (out1.toLong << 32) | (out2.toLong & 0xFFFFFFFFL)
+  // Cut chances are compared against the top 32 bits of a keyed PRF of the item alone.
+  // Leaves: chance per datom is bytes / avgBytes, halved below avgBytes and doubled
+  // above it (FastCDC-style normalization). Internal nodes: 1 / targetBranchingFactor,
+  // halved below the target and doubled above it.
+  private def leafCutThreshold(datomBytes: Int, chunkBytes: Int): Long = {
+    val scaled = (datomBytes.toLong << 32) / avgBytes
+    if (chunkBytes < avgBytes) scaled >> 1 else scaled << 1
   }
 
-  def chunkDatoms(datoms: Iterator[Datom]): Iterator[Seq[Datom]] = new Iterator[Seq[Datom]] {
-    var hash = 0L
+  private def internalCutThreshold(keys: Int): Long = {
+    val scaled = (1L << 32) / targetBranchingFactor
+    if (keys < targetBranchingFactor) scaled >> 1 else scaled << 1
+  }
 
-    override def hasNext: Boolean = datoms.hasNext
+  /** Whether `datom` ends a leaf once minKeys is reached. Needs the secret key; exposed for tests. */
+  def cutsLeaf(datom: Datom, chunkBytes: Int): Boolean =
+    (SipHash24.hash(key, encode(datom)) >>> 32) < leafCutThreshold(Datom.sizeInBytes(datom), chunkBytes)
 
-    override def next(): Seq[Datom] = {
-      val currentChunk = mutable.ArrayBuffer[Datom]()
-      var currentKeys = 0
-      var currentBytes = 0
+  // Decides chunk boundaries one item at a time. The state (item and byte counts) is
+  // reset after every cut, so a boundary depends only on the items since the previous one.
+  // That makes chunking a pure function of the item sequence (history independence)
+  // and lets an incremental update stop once it re-aligns with an old boundary.
+  trait Cutter[T] {
+    /** Adds an item to the current chunk; returns true if the chunk ends after it. */
+    def offer(item: T): Boolean
+  }
+
+  def newLeafCutter(): Cutter[Datom] = new Cutter[Datom] {
+    private var keys = 0
+    private var bytes = 0
+
+    override def offer(datom: Datom): Boolean = {
+      keys += 1
+      bytes += Datom.sizeInBytes(datom)
+
+      val cut =
+        if (bytes >= maxBytes) true
+        else if (keys >= minKeys) cutsLeaf(datom, bytes)
+        else false
+
+      if (cut) { keys = 0; bytes = 0 }
+      cut
+    }
+  }
+
+  def newInternalCutter(): Cutter[(Datom, String)] = new Cutter[(Datom, String)] {
+    private var keys = 0
+
+    override def offer(child: (Datom, String)): Boolean = {
+      keys += 1
+
+      val cut =
+        if (keys >= maxKeysPerInternalNode) true
+        else if (keys >= minKeys)
+          (SipHash24.hash(key, child._2.getBytes("UTF-8")) >>> 32) < internalCutThreshold(keys)
+        else false
+
+      if (cut) keys = 0
+      cut
+    }
+  }
+
+  private def chunk[T](items: Iterator[T], cutter: Cutter[T]): Iterator[Seq[T]] = new Iterator[Seq[T]] {
+    override def hasNext: Boolean = items.hasNext
+
+    override def next(): Seq[T] = {
+      val currentChunk = mutable.ArrayBuffer[T]()
       var makeCut = false
-
-      while (datoms.hasNext && !makeCut) {
-        val datom = datoms.next()
-        currentChunk += datom
-        currentKeys += 1
-
-        currentBytes += Datom.sizeInBytes(datom)
-
-        val entropy = preHashDatom(datom)
-        hash = hashLong(entropy, hash)
-
-        if (currentBytes >= maxBytes) {
-          makeCut = true
-        } else if (currentKeys >= minKeys) {
-          val mask = if (currentBytes < avgBytes) maskS else maskL
-          if ((hash & mask) == 0L) {
-            makeCut = true
-          }
-        }
+      while (items.hasNext && !makeCut) {
+        val item = items.next()
+        currentChunk += item
+        makeCut = cutter.offer(item)
       }
       currentChunk.toSeq
     }
   }
 
-  def computeInternalBoundaries(children: Iterator[(Datom, String)]): Iterator[Seq[(Datom, String)]] = new Iterator[Seq[(Datom, String)]] {
-    var hash = 0L
+  def chunkDatoms(datoms: Iterator[Datom]): Iterator[Seq[Datom]] = chunk(datoms, newLeafCutter())
 
-    override def hasNext: Boolean = children.hasNext
-
-    override def next(): Seq[(Datom, String)] = {
-      val currentChunk = mutable.ArrayBuffer[(Datom, String)]()
-      var currentKeys = 0
-      var makeCut = false
-
-      while (children.hasNext && !makeCut) {
-        val child = children.next()
-        currentChunk += child
-        currentKeys += 1
-
-        val shaEntropy = java.lang.Long.parseUnsignedLong(child._2.substring(0, 16), 16)
-        hash = hashLong(shaEntropy, hash)
-
-        if (currentKeys >= maxKeysPerInternalNode) {
-          makeCut = true
-        } else if (currentKeys >= minKeys) {
-          val mask = if (currentKeys < targetBranchingFactor) internalMaskS else internalMaskL
-          if ((hash & mask) == 0L) makeCut = true
-        }
-      }
-      currentChunk.toSeq
-    }
-  }
+  def computeInternalBoundaries(children: Iterator[(Datom, String)]): Iterator[Seq[(Datom, String)]] =
+    chunk(children, newInternalCutter())
 }
 
 // ==========================================
@@ -213,8 +276,17 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
     digest.digest().map("%02x".format(_)).mkString
   }
 
+  // The empty tree is a single leaf with no datoms.
+  def emptyTree(): ProllyNode = {
+    val node = LeafNode(computeLeafHash(Nil), Nil)
+    store.put(node)
+    node
+  }
+
   def buildInitialTree(datoms: Seq[Datom]): ProllyNode = {
-    val sorted = datoms.sorted
+    datoms.foreach(chunker.validate)
+    if (datoms.isEmpty) return emptyTree()
+    val sorted = datoms.distinct.sorted
     val leaves = chunker.chunkDatoms(sorted.iterator).map { chunk =>
       val node = LeafNode(computeLeafHash(chunk), chunk)
       store.put(node)
@@ -240,74 +312,157 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
     buildInternalLayers(parents, currentLevel + 1)
   }
 
-  def insertBatch(rootHash: String, newDatoms: Seq[Datom]): ProllyNode = {
-    if (newDatoms.isEmpty) return store.get(rootHash)
+  def insertBatch(rootHash: String, newDatoms: Seq[Datom]): ProllyNode =
+    applyBatch(rootHash, inserts = newDatoms, deletes = Nil)
 
-    val sortedBatch = newDatoms.sorted
-    val updatedNodes = insertBatchRecursive(rootHash, sortedBatch)
+  /** Removes datoms equal to the given ones; datoms not in the tree are ignored. */
+  def deleteBatch(rootHash: String, datoms: Seq[Datom]): ProllyNode =
+    applyBatch(rootHash, inserts = Nil, deletes = datoms)
 
-    if (updatedNodes.length == 1) {
-      updatedNodes.head
-    } else {
-      val topLevel = updatedNodes.head.level + 1
-      buildInternalLayers(updatedNodes, topLevel)
+  // Applies inserts and deletes level by level, bottom-up. At each level only nodes whose
+  // content changed are re-chunked, and re-chunking keeps pulling in the following
+  // siblings until a cut lands exactly on an old node boundary. The result is the same
+  // tree buildInitialTree would produce for the resulting data, whatever the history.
+  // A datom present in both lists ends up deleted.
+  def applyBatch(rootHash: String, inserts: Seq[Datom], deletes: Seq[Datom]): ProllyNode = {
+    inserts.foreach(chunker.validate)
+    val root = store.get(rootHash)
+    if (inserts.isEmpty && deletes.isEmpty) return root
+    if (isEmpty(root)) return buildInitialTree(inserts.filterNot(deletes.toSet))
+
+    val levels = nodesByLevel(root)
+
+    // Level 0: route each datom to the leaf whose key range contains it.
+    val leaves = levels.head
+    val added = mutable.Map[Int, mutable.ArrayBuffer[Datom]]()
+    val removed = mutable.Map[Int, mutable.HashSet[Datom]]()
+    inserts.foreach(d => added.getOrElseUpdate(findNodeIndex(leaves, d), mutable.ArrayBuffer[Datom]()) += d)
+    deletes.foreach(d => removed.getOrElseUpdate(findNodeIndex(leaves, d), mutable.HashSet[Datom]()) += d)
+
+    val newContents = mutable.Map[Int, Seq[Datom]]()
+    (added.keySet ++ removed.keySet).foreach { i =>
+      val old = leaves(i).asInstanceOf[LeafNode].datoms
+      val gone = removed.getOrElse(i, mutable.HashSet.empty[Datom])
+      val updated = (old ++ added.getOrElse(i, Nil)).distinct.filterNot(gone).sorted
+      if (updated != old) newContents(i) = updated
     }
+    if (newContents.isEmpty) return root
+
+    var replacements = rechunkLevel[Datom](
+      leaves.length,
+      i => newContents.getOrElse(i, leaves(i).asInstanceOf[LeafNode].datoms),
+      i => newContents.contains(i),
+      i => leaves(i),
+      () => chunker.newLeafCutter(),
+      chunk => LeafNode(computeLeafHash(chunk), chunk)
+    )
+
+    var level = 1
+    while (level < levels.length) {
+      val below = replacements.flatten.toIndexedSeq
+      if (below.isEmpty) return emptyTree()
+      if (below.length == 1) return below.head
+
+      val oldBelow = levels(level - 1)
+      val changed = oldBelow.indices.map { j =>
+        !(replacements(j).length == 1 && (replacements(j).head eq oldBelow(j)))
+      }
+
+      val nodes = levels(level)
+      val childStart = nodes.scanLeft(0)((acc, n) => acc + n.asInstanceOf[InternalNode].children.length)
+      val nodeLevel = level
+
+      replacements = rechunkLevel[(Datom, String)](
+        nodes.length,
+        i => (childStart(i) until childStart(i + 1)).flatMap(j => replacements(j).map(n => (n.firstKey, n.hash))),
+        i => (childStart(i) until childStart(i + 1)).exists(changed),
+        i => nodes(i),
+        () => chunker.newInternalCutter(),
+        slice => InternalNode(computeInternalHash(slice), slice, nodeLevel)
+      )
+      level += 1
+    }
+
+    val top = replacements.flatten.toIndexedSeq
+    if (top.isEmpty) emptyTree()
+    else if (top.length == 1) top.head
+    else buildInternalLayers(top, levels.length)
   }
 
-  private def insertBatchRecursive(nodeHash: String, batch: Seq[Datom]): Seq[ProllyNode] = {
-    store.get(nodeHash) match {
-      case leaf: LeafNode =>
-        val combinedDatoms = (leaf.datoms ++ batch).distinct.sorted
-        val newLeafChunks = chunker.chunkDatoms(combinedDatoms.iterator).map { chunk =>
-          val newLeaf = LeafNode(computeLeafHash(chunk), chunk)
-          store.put(newLeaf)
-          newLeaf
-        }.toSeq
-        newLeafChunks
+  private def isEmpty(node: ProllyNode): Boolean = node match {
+    case leaf: LeafNode => leaf.datoms.isEmpty
+    case _ => false
+  }
 
-      case internal: InternalNode =>
-        val children = internal.children
-        val batchAssignments = mutable.Map[Int, mutable.ArrayBuffer[Datom]]()
+  // Returns the nodes of each level in key order, index 0 being the leaves.
+  private def nodesByLevel(root: ProllyNode): IndexedSeq[IndexedSeq[ProllyNode]] = {
+    val levels = mutable.ArrayBuffer[IndexedSeq[ProllyNode]](IndexedSeq(root))
+    while (levels.last.head.level > 0) {
+      levels += levels.last.flatMap(n => n.asInstanceOf[InternalNode].children.map(c => store.get(c._2)))
+    }
+    levels.reverse.toIndexedSeq
+  }
 
-        batch.foreach { datom =>
-          val idx = findChildIndex(children, datom)
-          batchAssignments.getOrElseUpdate(idx, mutable.ArrayBuffer[Datom]()) += datom
+  // Re-chunks one level. `contents(i)` is the new item list of old node i. Clean nodes are
+  // reused while the cutter sits on a boundary; from a dirty node on, items are fed through
+  // a fresh cutter until it cuts at the end of an old node followed by a clean one.
+  // Returns, per old node, the nodes replacing it: the output of a re-chunked run is
+  // attributed to its first old node and the other old nodes in the run get none.
+  private def rechunkLevel[T](
+                               count: Int,
+                               contents: Int => Seq[T],
+                               dirty: Int => Boolean,
+                               oldNode: Int => ProllyNode,
+                               newCutter: () => chunker.Cutter[T],
+                               makeNode: Seq[T] => ProllyNode
+                             ): Array[Seq[ProllyNode]] = {
+    val out = Array.fill[Seq[ProllyNode]](count)(Nil)
+    var i = 0
+    while (i < count) {
+      if (!dirty(i)) {
+        out(i) = Seq(oldNode(i))
+        i += 1
+      } else {
+        val start = i
+        val cutter = newCutter()
+        val emitted = mutable.ArrayBuffer[ProllyNode]()
+        val current = mutable.ArrayBuffer[T]()
+
+        def emit(): Unit = {
+          val node = makeNode(current.toSeq)
+          store.put(node)
+          emitted += node
+          current.clear()
         }
 
-        val newChildrenPointers = mutable.ArrayBuffer[(Datom, String)]()
-
-        for (i <- children.indices) {
-          val (oldKey, childHash) = children(i)
-          if (batchAssignments.contains(i)) {
-            val childBatch = batchAssignments(i).toSeq
-            val updatedChildNodes = insertBatchRecursive(childHash, childBatch)
-            updatedChildNodes.foreach { newChild =>
-              newChildrenPointers += ((newChild.firstKey, newChild.hash))
-            }
-          } else {
-            newChildrenPointers += ((oldKey, childHash))
+        var aligned = false
+        while (!aligned) {
+          contents(i).foreach { item =>
+            current += item
+            if (cutter.offer(item)) emit()
+          }
+          i += 1
+          if (i == count) {
+            if (current.nonEmpty) emit()
+            aligned = true
+          } else if (current.isEmpty && !dirty(i)) {
+            aligned = true
           }
         }
-
-        val boundaries = chunker.computeInternalBoundaries(newChildrenPointers.iterator).toSeq
-        boundaries.map { slice =>
-          val newInternal = InternalNode(computeInternalHash(slice), slice, internal.level)
-          store.put(newInternal)
-          newInternal
-        }
+        out(start) = emitted.toSeq
+      }
     }
+    out
   }
 
-  private def findChildIndex(children: Seq[(Datom, String)], datom: Datom): Int = {
+  private def findNodeIndex(nodes: IndexedSeq[ProllyNode], datom: Datom): Int = {
     var low = 0
-    var high = children.length - 1
+    var high = nodes.length - 1
     var result = 0
 
     while (low <= high) {
       val mid = (low + high) / 2
-      val comparison = Datom.ordering.compare(datom, children(mid)._1)
-
-      if (comparison >= 0) {
+      if (Datom.ordering.compare(datom, nodes(mid).firstKey) >= 0) {
         result = mid
         low = mid + 1
       } else {
@@ -327,6 +482,27 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
     }
   }
 
+  def getEntityDatoms(rootHash: String, entity: Long): Seq[Datom] = {
+    store.get(rootHash) match {
+      case leaf: LeafNode => leaf.datoms.filter(_.e == entity)
+      case internal: InternalNode =>
+        val children = internal.children
+        children.indices.flatMap { i =>
+          // Child i holds keys from its first key up to the next child's first key.
+          val mayContain = children(i)._1.e <= entity && (i + 1 == children.length || children(i + 1)._1.e >= entity)
+          if (mayContain) getEntityDatoms(children(i)._2, entity) else Nil
+        }
+    }
+  }
+
+  def countDatoms(rootHash: String): Long = {
+    store.get(rootHash) match {
+      case leaf: LeafNode => leaf.datoms.length.toLong
+      case internal: InternalNode =>
+        internal.children.map { case (_, childHash) => countDatoms(childHash) }.sum
+    }
+  }
+
   def getTreeByteSize(rootHash: String): Long = {
     store.get(rootHash) match {
       case leaf: LeafNode => leaf.byteSize.toLong
@@ -339,74 +515,346 @@ class DatomProllyTreeManager(val store: KVStore, val chunker: DatomFastCDC) {
 }
 
 // ==========================================
-// 5. DEMO EXECUTION
+// 5. UNTRUSTED ACCESS
+// ==========================================
+
+// Limits for writes coming from untrusted clients.
+//  - Every client has a token bucket: `datomsPerSecond` refill, up to `burst` tokens.
+//  - Inserting or deleting a datom costs 1 token.
+//  - Deleting a datom that anyone inserted less than `churnWindowMs` ago costs
+//    `churnCost` tokens. Insert-then-delete is how someone probes for chunk boundaries
+//    without leaving the probes in the tree, so it is made expensive. It is tracked
+//    across clients, so inserting from one client and deleting from another doesn't help.
+final case class WriteLimits(
+                              datomsPerSecond: Double = 1000.0,
+                              burst: Double = 5000.0,
+                              churnWindowMs: Long = 60000L,
+                              churnCost: Double = 50.0
+                            )
+
+class WriteRateLimiter(limits: WriteLimits, clock: () => Long = () => System.currentTimeMillis()) {
+  private final class Bucket(var tokens: Double, var lastRefillMs: Long)
+
+  private val buckets = mutable.Map[String, Bucket]()
+  // Datoms inserted within the churn window, oldest first.
+  private val recentInserts = mutable.LinkedHashMap[Datom, Long]()
+
+  /** Charges the batch to `client`. Returns 0 if allowed, else the ms to wait before retrying. */
+  def acquire(client: String, inserts: Seq[Datom], deletes: Seq[Datom]): Long = synchronized {
+    val now = clock()
+    forgetOldInserts(now)
+
+    val bucket = buckets.getOrElseUpdate(client, new Bucket(limits.burst, now))
+    bucket.tokens = math.min(limits.burst, bucket.tokens + (now - bucket.lastRefillMs) * limits.datomsPerSecond / 1000.0)
+    bucket.lastRefillMs = now
+
+    val cost = inserts.length + deletes.map(d => if (recentInserts.contains(d)) limits.churnCost else 1.0).sum
+    if (cost > limits.burst) Long.MaxValue // can never fit; the batch must be split
+    else if (cost > bucket.tokens) math.ceil((cost - bucket.tokens) * 1000.0 / limits.datomsPerSecond).toLong
+    else {
+      bucket.tokens -= cost
+      inserts.foreach { d => recentInserts.remove(d); recentInserts.put(d, now) }
+      0L
+    }
+  }
+
+  private def forgetOldInserts(now: Long): Unit = {
+    while (recentInserts.nonEmpty && now - recentInserts.head._2 >= limits.churnWindowMs)
+      recentInserts.remove(recentInserts.head._1)
+  }
+}
+
+sealed trait TxResult
+object TxResult {
+  case object Committed extends TxResult
+  final case class RateLimited(retryAfterMs: Long) extends TxResult
+  final case class Rejected(reason: String) extends TxResult
+}
+
+// The API to hand to untrusted clients. It exposes datoms only: no root or node hashes,
+// no nodes, node sizes, block counts or tree stats. Those reveal where chunks end,
+// which is exactly what someone probing for boundaries needs to observe. Writes go
+// through the rate limiter, and a rejected batch changes nothing.
+class DatomDatabase(manager: DatomProllyTreeManager, limiter: WriteRateLimiter) {
+  private var root: ProllyNode = manager.emptyTree()
+
+  def transact(client: String, inserts: Seq[Datom], deletes: Seq[Datom] = Nil): TxResult = synchronized {
+    try inserts.foreach(manager.chunker.validate)
+    catch { case e: IllegalArgumentException => return TxResult.Rejected(e.getMessage) }
+
+    limiter.acquire(client, inserts, deletes) match {
+      case 0L =>
+        root = manager.applyBatch(root.hash, inserts, deletes)
+        TxResult.Committed
+      case Long.MaxValue => TxResult.Rejected("Batch is larger than the write burst limit; split it")
+      case waitMs => TxResult.RateLimited(waitMs)
+    }
+  }
+
+  def entity(e: Long): Seq[Datom] = synchronized(manager.getEntityDatoms(root.hash, e))
+  def datoms: Seq[Datom] = synchronized(manager.getAllDatoms(root.hash))
+  def count: Long = synchronized(manager.countDatoms(root.hash))
+}
+
+// ==========================================
+// 6. DEMO EXECUTION
 // ==========================================
 
 object ProllyTreeDemo extends App {
 
-  val store = new KVStore()
-  val chunker = new DatomFastCDC(minKeys = 10, avgBytes = 2048, maxBytes = 8192, targetBranchingFactor = 64)
-  val manager = new DatomProllyTreeManager(store, chunker)
+  // Attribute ids used in the `a` field of Datom.
+  object Attributes {
+    final val UserName: Long = 10L
+    final val UserAge: Long = 11L
+    final val UserEmail: Long = 12L
+    final val Follows: Long = 13L
+    final val LikesFruit: Long = 14L
+    // Set on a follow-edge entity (see followEdgeId): epoch millis when the follow started.
+    final val FollowStartedAt: Long = 15L
 
-  println("1. Generating initial base dataset of 100,000 datoms...")
-  val initialDatoms = (1L to 5000000L).flatMap { e =>
-    Seq(
-      Datom(e, 10L, s"User_$e", 1L, op = true),
-      Datom(e, 11L, 25L, 1L, op = true)
+    // Attributes whose value is a String; every other attribute holds a Long.
+    val stringValued: Set[Long] = Set(UserName, UserEmail, LikesFruit)
+
+    val names: Map[Long, String] = Map(
+      UserName -> "UserName", UserAge -> "UserAge", UserEmail -> "UserEmail",
+      Follows -> "Follows", LikesFruit -> "LikesFruit", FollowStartedAt -> "FollowStartedAt"
     )
   }
 
-  println("2. Building initial Prolly Tree...")
-  val initialRoot = manager.buildInitialTree(initialDatoms)
-  val initialStoreSize = store.size
-  val initialSizeMB = manager.getTreeByteSize(initialRoot.hash) / (1024.0 * 1024.0)
+  val Fruits: Seq[String] = Seq(
+    "Apple", "Banana", "Cherry", "Grape", "Mango", "Orange", "Peach", "Pear",
+    "Pineapple", "Strawberry", "Watermelon", "Kiwi", "Blueberry", "Papaya", "Lemon"
+  )
 
-  println(s"   Initial Root Hash: ${initialRoot.hash}")
-  println(s"   Total KV Blocks:   $initialStoreSize")
-  println(f"   Tree Byte Size:    $initialSizeMB%.2f MB")
+  val CsvPath = "1M_datoms.csv"
+  val TotalDatoms = 1000000
+  val NumUsers = 10000
+  val MinFruitsPerUser = 1
+  val MaxFruitsPerUser = 5
+  val MinBatchSize = 10
+  val MaxBatchSize = 1000
+  val UsersTx = 1L
+  val FollowsStartMs = 1704067200000L // 2024-01-01T00:00:00Z
 
-  println("\n3. Performing Batch Insert of 500 NEW datoms across random entities...")
-  val batchToInsert = Seq(
-    Datom(500L, 12L, "Blue", 2L, op = true),
-    Datom(25000L, 12L, "Green", 2L, op = true),
-    Datom(99999L, 12L, "Coding", 2L, op = true)
-  ) ++ (100001L to 100247L).map(e => Datom(e, 10L, s"NewUser_$e", 2L, op = true))
+  // Entity id of the "follower follows followee" relationship, used to attach
+  // edge attributes like FollowStartedAt. Offset keeps it clear of user ids.
+  val FollowEdgeIdBase = 1000000000L
+  def followEdgeId(follower: Long, followee: Long): Long =
+    FollowEdgeIdBase + follower * (NumUsers + 1) + followee
 
-  val startTime = System.currentTimeMillis()
-  val newRootNode = manager.insertBatch(initialRoot.hash, batchToInsert)
-  val endTime = System.currentTimeMillis()
-
-  val blocksAdded = store.size - initialStoreSize
-  val newSizeMB = manager.getTreeByteSize(newRootNode.hash) / (1024.0 * 1024.0)
-
-  println("\n--- BATCH INSERT COMPLETE ---")
-  println(s"Time Taken:         ${endTime - startTime} ms")
-  println(s"New Root Hash:      ${newRootNode.hash}")
-  println(s"New Total Blocks:   ${store.size}")
-  println(s"New Blocks Saved:   $blocksAdded (Only updated path-copied blocks were minted!)")
-  println(f"New Tree Byte Size: $newSizeMB%.2f MB")
-
-  println("\n--- VERIFYING CURRENT DATA INTEGRITY (AFTER BATCH) ---")
-  val newTreeDatoms = manager.getAllDatoms(newRootNode.hash)
-  val expectedNewTotal = initialDatoms.length + batchToInsert.length
-
-  if (newTreeDatoms.length == expectedNewTotal && newTreeDatoms == newTreeDatoms.sorted) {
-    println("SUCCESS: The NEW tree contains all merged data in perfect order.")
-  } else {
-    println("ERROR: The new tree data verification failed.")
+  def timed[T](label: String)(block: => T): (T, Long) = {
+    val start = System.nanoTime()
+    val result = block
+    val elapsedMs = (System.nanoTime() - start) / 1000000
+    println(f"   [$label] took $elapsedMs%,d ms")
+    (result, elapsedMs)
   }
 
-  println("\n--- VERIFYING HISTORICAL INTEGRITY (BEFORE BATCH) ---")
-  val oldTreeDatoms = manager.getAllDatoms(initialRoot.hash)
+  // Users are written first (tx 1), then follow relationships grouped by tx id:
+  // each follow tx is one random-sized batch of 10..1000 datoms. Every follow is
+  // two datoms: `follower Follows followee` and `edge FollowStartedAt millis`.
+  def generateCsv(path: String): Unit = {
+    val rnd = new scala.util.Random(42L)
+    val out = new PrintWriter(new java.io.BufferedWriter(new java.io.FileWriter(path), 1 << 20))
+    try {
+      out.println("e,a,v,t,op")
 
-  if (oldTreeDatoms.length == initialDatoms.length && oldTreeDatoms == initialDatoms.sorted) {
-    println(s"SUCCESS: The OLD tree (${initialRoot.hash}) perfectly retained its original state! Immutability verified.")
-  } else {
-    println("ERROR: The historical tree data was mutated or corrupted.")
+      val userFruits = Array.fill(NumUsers) {
+        rnd.shuffle(Fruits).take(MinFruitsPerUser + rnd.nextInt(MaxFruitsPerUser - MinFruitsPerUser + 1))
+      }
+      // Follows come in pairs of datoms, so the remaining budget must be even.
+      if ((TotalDatoms - NumUsers * 3 - userFruits.map(_.length).sum) % 2 != 0) {
+        val idx = userFruits.indexWhere(_.length < Fruits.length)
+        userFruits(idx) = userFruits(idx) :+ Fruits.find(f => !userFruits(idx).contains(f)).get
+      }
+
+      for (u <- 1L to NumUsers.toLong) {
+        out.println(s"$u,${Attributes.UserName},User_$u,$UsersTx,true")
+        out.println(s"$u,${Attributes.UserAge},${18 + rnd.nextInt(63)},$UsersTx,true")
+        out.println(s"$u,${Attributes.UserEmail},user$u@example.com,$UsersTx,true")
+        userFruits((u - 1).toInt).foreach(f => out.println(s"$u,${Attributes.LikesFruit},$f,$UsersTx,true"))
+      }
+
+      val minFollows = MinBatchSize / 2
+      val maxFollows = MaxBatchSize / 2
+      val seenPairs = mutable.HashSet[Long]()
+      var remaining = (TotalDatoms - NumUsers * 3 - userFruits.map(_.length).sum) / 2
+      var tx = UsersTx + 1
+      var clockMs = FollowsStartMs
+      while (remaining > 0) {
+        val batchFollows =
+          if (remaining <= maxFollows) remaining
+          else {
+            val s = minFollows + rnd.nextInt(maxFollows - minFollows + 1)
+            if (remaining - s < minFollows) s - minFollows else s
+          }
+        // Each batch lands 1..60 s after the previous one; follows inside it within 1 s.
+        clockMs += 1000L + rnd.nextInt(59000)
+        var written = 0
+        while (written < batchFollows) {
+          val follower = 1L + rnd.nextInt(NumUsers)
+          val followee = 1L + rnd.nextInt(NumUsers)
+          if (follower != followee && seenPairs.add(followEdgeId(follower, followee))) {
+            out.println(s"$follower,${Attributes.Follows},$followee,$tx,true")
+            out.println(s"${followEdgeId(follower, followee)},${Attributes.FollowStartedAt},${clockMs + rnd.nextInt(1000)},$tx,true")
+            written += 1
+          }
+        }
+        remaining -= batchFollows
+        tx += 1
+      }
+    } finally out.close()
   }
 
-  printTreeStats(manager, newRootNode.hash)
+  def loadCsv(path: String): Vector[Datom] = {
+    val src = Source.fromFile(path)
+    try {
+      src.getLines().drop(1).map { line =>
+        val cols = line.split(',')
+        val a = cols(1).toLong
+        val v: Any = if (Attributes.stringValued.contains(a)) cols(2) else cols(2).toLong
+        Datom(cols(0).toLong, a, v, cols(3).toLong, cols(4).toBoolean)
+      }.toVector
+    } finally src.close()
+  }
 
+  def percentile(sorted: IndexedSeq[Long], pct: Double): Long =
+    sorted((sorted.length * pct).toInt min (sorted.length - 1))
+
+  val store = new KVStore()
+  val chunker = new DatomFastCDC(ChunkerKey.random(), minKeys = 10, avgBytes = 2048, maxBytes = 8192, targetBranchingFactor = 64)
+  val manager = new DatomProllyTreeManager(store, chunker)
+
+  println(s"1. Preparing workload file $CsvPath...")
+  if (new File(CsvPath).exists()) println("   File already exists, reusing it.")
+  else timed("Generate CSV")(generateCsv(CsvPath))
+
+  println("\n2. Loading datoms from CSV...")
+  val (allDatoms, loadMs) = timed("Load CSV")(loadCsv(CsvPath))
+  val userDatoms = allDatoms.filter(_.t == UsersTx)
+  val followBatches = allDatoms.filter(_.t != UsersTx).groupBy(_.t).toVector.sortBy(_._1).map(_._2)
+  println(f"   Loaded ${allDatoms.length}%,d datoms: ${userDatoms.length}%,d user datoms, " +
+    f"${followBatches.map(_.length).sum}%,d follow datoms in ${followBatches.length}%,d batches")
+  allDatoms.groupBy(_.a).toSeq.sortBy(_._1).foreach { case (a, ds) =>
+    println(f"     ${Attributes.names.getOrElse(a, a.toString)}%-16s ${ds.length}%,9d datoms")
+  }
+
+  val followDatoms = followBatches.flatten.filter(_.a == Attributes.Follows)
+  val selfFollows = followDatoms.count(d => d.e == d.v)
+  val duplicateFollows = followDatoms.length - followDatoms.map(d => (d.e, d.v)).distinct.length
+  if (selfFollows == 0 && duplicateFollows == 0)
+    println("   Follow relationships OK: no self-follows, no user follows the same user twice.")
+  else
+    println(f"   ERROR: $selfFollows%,d self-follows and $duplicateFollows%,d duplicate follow pairs in the workload.")
+
+  println(f"\n3. Inserting $NumUsers%,d users (${userDatoms.length}%,d datoms)...")
+  val (beforeRoot, usersMs) = timed("Build users tree")(manager.buildInitialTree(userDatoms))
+  val beforeStoreSize = store.size
+  println(s"   Root after users:  ${beforeRoot.hash}")
+  println(s"   Total KV Blocks:   $beforeStoreSize")
+  println(f"   Tree Byte Size:    ${manager.getTreeByteSize(beforeRoot.hash) / (1024.0 * 1024.0)}%.2f MB")
+
+  println(f"\n4. Inserting ${followBatches.length}%,d follow batches with insertBatch...")
+  val batchTimesNs = new Array[Long](followBatches.length)
+  val (afterRoot, followsMs) = timed("All follow batches") {
+    var root = beforeRoot
+    for ((batch, i) <- followBatches.zipWithIndex) {
+      val start = System.nanoTime()
+      root = manager.insertBatch(root.hash, batch)
+      batchTimesNs(i) = System.nanoTime() - start
+      if ((i + 1) % 250 == 0 || i + 1 == followBatches.length)
+        println(f"   ... ${i + 1}%,d/${followBatches.length}%,d batches, store blocks: ${store.size}%,d")
+    }
+    root
+  }
+  val sortedBatchMs = batchTimesNs.map(_ / 1000000).sorted.toIndexedSeq
+  val followCount = followBatches.map(_.length).sum
+  println(s"   Root after follows: ${afterRoot.hash}")
+  println(f"   Tree Elements:      ${manager.countDatoms(afterRoot.hash)}%,d datoms")
+  println(s"   Tree Levels:        ${afterRoot.level + 1} (root at level ${afterRoot.level}, leaves at level 0)")
+  println(s"   Total KV Blocks:    ${store.size} (${store.size - beforeStoreSize} minted by batches)")
+  println(f"   Tree Byte Size:     ${manager.getTreeByteSize(afterRoot.hash) / (1024.0 * 1024.0)}%.2f MB")
+  println(f"   Throughput:         ${followCount * 1000.0 / (followsMs max 1)}%,.0f datoms/s")
+  println(f"   Batch latency (ms): avg ${batchTimesNs.sum / 1e6 / batchTimesNs.length}%.2f | " +
+    f"p50 ${percentile(sortedBatchMs, 0.50)} | p90 ${percentile(sortedBatchMs, 0.90)} | " +
+    f"p99 ${percentile(sortedBatchMs, 0.99)} | max ${sortedBatchMs.last}")
+
+  println("\n--- VERIFYING CURRENT DATA INTEGRITY (AFTER ALL BATCHES) ---")
+  val (afterOk, verifyAfterMs) = timed("Verify after root") {
+    manager.getAllDatoms(afterRoot.hash) == allDatoms.sorted
+  }
+  if (afterOk) println(f"SUCCESS: The NEW tree (${afterRoot.hash}) contains all ${allDatoms.length}%,d datoms in perfect order.")
+  else println("ERROR: The new tree data verification failed.")
+
+  println("\n--- VERIFYING HISTORICAL INTEGRITY (AFTER USERS, BEFORE FOLLOWS) ---")
+  val (beforeOk, verifyBeforeMs) = timed("Verify before root") {
+    manager.getAllDatoms(beforeRoot.hash) == userDatoms.sorted
+  }
+  if (beforeOk) println(s"SUCCESS: The OLD tree (${beforeRoot.hash}) perfectly retained its original state! Immutability verified.")
+  else println("ERROR: The historical tree data was mutated or corrupted.")
+
+  println("\n--- VERIFYING HISTORY INDEPENDENCE (BULK LOAD vs. INCREMENTAL) ---")
+  val (bulkRoot, bulkMs) = timed("Bulk load all datoms") {
+    new DatomProllyTreeManager(new KVStore(), chunker).buildInitialTree(allDatoms)
+  }
+  if (bulkRoot.hash == afterRoot.hash)
+    println(s"SUCCESS: Bulk-loading the same ${allDatoms.length} datoms gives the same root (${bulkRoot.hash}).")
+  else
+    println(s"ERROR: Bulk-load root ${bulkRoot.hash} differs from incremental root ${afterRoot.hash}.")
+
+  println("\n5. Unfollowing: deleting 25% of follows in random batches of 10..1000 datoms...")
+  val unfollowRnd = new scala.util.Random(7L)
+  val edgeTimes = followBatches.flatten.filter(_.a == Attributes.FollowStartedAt).map(d => d.e -> d).toMap
+  // Each unfollow removes both datoms of the relationship.
+  val unfollowDatoms = unfollowRnd.shuffle(followDatoms).take(followDatoms.length / 4)
+    .flatMap(d => Seq(d, edgeTimes(followEdgeId(d.e, d.v.asInstanceOf[Long]))))
+  val unfollowBatches = {
+    val batches = mutable.ArrayBuffer[Vector[Datom]]()
+    var rest = unfollowDatoms
+    while (rest.nonEmpty) {
+      val size = 2 * ((MinBatchSize + unfollowRnd.nextInt(MaxBatchSize - MinBatchSize + 1)) / 2)
+      batches += rest.take(size)
+      rest = rest.drop(size)
+    }
+    batches.toVector
+  }
+  val (finalRoot, unfollowMs) = timed("All unfollow batches") {
+    unfollowBatches.foldLeft(afterRoot)((root, batch) => manager.deleteBatch(root.hash, batch))
+  }
+  val remainingDatoms = {
+    val deleted = unfollowDatoms.toSet
+    allDatoms.filterNot(deleted)
+  }
+  println(f"   Deleted ${unfollowDatoms.length}%,d datoms in ${unfollowBatches.length}%,d batches " +
+    f"(${unfollowDatoms.length * 1000.0 / (unfollowMs max 1)}%,.0f datoms/s)")
+  println(f"   Tree Elements:      ${manager.countDatoms(finalRoot.hash)}%,d datoms")
+  println(s"   Tree Levels:        ${finalRoot.level + 1}")
+
+  println("\n--- VERIFYING DELETES ---")
+  val (deletesOk, verifyDeletesMs) = timed("Verify deletes") {
+    manager.getAllDatoms(finalRoot.hash) == remainingDatoms.sorted &&
+      new DatomProllyTreeManager(new KVStore(), chunker).buildInitialTree(remainingDatoms).hash == finalRoot.hash &&
+      manager.countDatoms(afterRoot.hash) == allDatoms.length
+  }
+  if (deletesOk)
+    println(s"SUCCESS: The tree after unfollows (${finalRoot.hash}) holds exactly the remaining datoms, " +
+      "matches a bulk load of them, and the pre-delete root is intact.")
+  else
+    println("ERROR: Delete verification failed.")
+
+  printTreeStats(manager, finalRoot.hash)
+
+  println("\n==========================================")
+  println("              TIMING SUMMARY              ")
+  println("==========================================")
+  println(f"Load CSV:              $loadMs%,8d ms")
+  println(f"Insert users:          $usersMs%,8d ms")
+  println(f"Insert follow batches: $followsMs%,8d ms")
+  println(f"Verify after root:     $verifyAfterMs%,8d ms")
+  println(f"Verify before root:    $verifyBeforeMs%,8d ms")
+  println(f"Bulk load (check):     $bulkMs%,8d ms")
+  println(f"Delete unfollows:      $unfollowMs%,8d ms")
+  println(f"Verify deletes:        $verifyDeletesMs%,8d ms")
   println()
 
   // --- STATISTICAL ANALYSIS METHOD ---
